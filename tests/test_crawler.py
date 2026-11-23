@@ -185,6 +185,359 @@ class UnitCrawl(unittest.TestCase):
             run(crawl_id)
             self.assertEqual(storage.job_status(db)["state"], "cancelled")
 
+    def test_group_shared_footer_link_across_templates(self):
+        from flin_crawler_mcp.server import group_crawl_issues
+
+        def page(h1):
+            return (
+                200,
+                "text/html",
+                f'<html lang="de-CH"><main><h1>{h1}</h1></main><footer><a href="/404">Downloads</a></footer></html>',
+            )
+
+        with patch.dict(
+            FIXTURE, {"/de/shop/one": page("Eins"), "/de/shop/two": page("Zwei")}
+        ):
+            cid = self.crawl(
+                urls=[BASE + "/de/shop/one", BASE + "/de/shop/two"],
+                use_sitemaps=False,
+                page_types={"product": "/de/shop/"},
+            )
+        groups = group_crawl_issues(
+            cid,
+            ["cause", "location", "language", "page_type", "directory"],
+            code="broken_link",
+        )["rows"]
+        self.assertEqual(len(groups), 1, groups)
+        self.assertEqual(
+            (
+                groups[0]["affected_urls"],
+                groups[0]["location"],
+                groups[0]["page_type"],
+                groups[0]["language"],
+                groups[0]["directory"],
+            ),
+            (2, "footer", "product", "de-ch", "/de/"),
+        )
+        self.assertEqual(groups[0]["cause"], BASE + "/404")
+
+    def test_changed_fields_on_rechecked_pages(self):
+        a = self.crawl()
+        changed = (
+            200,
+            "text/html",
+            INDEX.replace("<title>Shop</title>", "<title>New shop</title>").replace(
+                'href="/404"', 'href="/fixed"'
+            ),
+        )
+        with patch.dict(FIXTURE, {"/": changed}):
+            b = self.crawl()
+        for field in ("title", "link_added", "link_removed"):
+            changes = storage.compare(a, b, 0, 100, "fields", field, BASE + "/")["rows"]
+            self.assertEqual(len(changes), 1, changes)
+            if field == "title":
+                self.assertEqual(
+                    (changes[0]["before"], changes[0]["after"]), ("Shop", "New shop")
+                )
+            else:
+                key = "after" if field == "link_added" else "before"
+                self.assertEqual(json.loads(changes[0][key])["anchor"], "Details")
+        self.assertTrue(storage.compare(a, b, 0, 1, "fields")["next_offset"])
+
+    def test_locale_sources_codes_conflicts_and_explicit_hosts(self):
+        from flin_crawler_mcp.international import valid_locale
+
+        self.assertTrue(
+            all(valid_locale(s) for s in ("de-ch", "fr", "zh-hant-tw", "x-default"))
+        )
+        self.assertFalse(
+            any(valid_locale(s) for s in ("en-uk", "zz-ch", "de-zz", "ch_zh", "en-419"))
+        )
+        de = BASE + "/de/a"
+        fr = "https://fr.fixture.example/fr/a"
+        xml = f'<urlset xmlns:xhtml="http://www.w3.org/1999/xhtml"><url><loc>{de}</loc><xhtml:link rel="alternate" hreflang="fr" href="{fr}"/><xhtml:link rel="alternate" hreflang="de" href="{de}"/></url></urlset>'
+
+        def network(url, **kwargs):
+            if url == de:
+                return Response(
+                    200,
+                    {
+                        "content-type": "text/html",
+                        "link": f'<{BASE}/wrong>; rel="alternate"; hreflang="fr"',
+                    },
+                    b'<html lang="de"><head><link rel="alternate" hreflang="zz" href="/bad"></head></html>',
+                    1,
+                )
+            if url == fr:
+                return Response(
+                    200,
+                    {"content-type": "text/html"},
+                    f'<link rel="alternate" hreflang="it" href="{fr}">'.encode(),
+                    1,
+                )
+            if url == BASE + "/child.xml":
+                return Response(
+                    200, {"content-type": "application/xml"}, xml.encode(), 1
+                )
+            return fixture(url, **kwargs)
+
+        cid = storage.create(config(urls=[de], additional_hosts=["fr.fixture.example"]))
+        with patch("flin_crawler_mcp.network.fetch", side_effect=network):
+            run(cid)
+        with closing(storage.connect(cid)) as db:
+            self.assertEqual(storage.job_status(db)["state"], "completed")
+            self.assertTrue(
+                db.execute("SELECT 1 FROM pages WHERE url=?", (fr,)).fetchone()
+            )
+            self.assertEqual(
+                {
+                    r["channel"]
+                    for r in storage.report(db, "alternates", 0, 100, url=de)["rows"]
+                },
+                {"http", "sitemap", "html"},
+            )
+            codes = {
+                r[0] for r in db.execute("SELECT code FROM issues WHERE url=?", (de,))
+            }
+            self.assertTrue(
+                {
+                    "hreflang_invalid_code",
+                    "hreflang_conflicting_targets",
+                    "hreflang_language_conflict",
+                    "hreflang_missing_return",
+                }
+                <= codes,
+                codes,
+            )
+
+    def test_suggest_unlinked_phrases_and_similar_copy(self):
+        content = " ".join("word" + str(i) for i in range(150))
+        docs = {
+            "/guide": (
+                "de",
+                "Bergtour planen",
+                "Zu dieser Route passen unsere Leichten Bergschuhe besonders gut.",
+            ),
+            "/boots": ("de", "Leichte Bergschuhe", "Sommerwandern in der Schweiz."),
+            "/fr": (
+                "fr",
+                "Voyages en train",
+                "Auch Leichte Bergschuhe werden erwähnt.",
+            ),
+            "/linked": (
+                "de",
+                "Schuhe am Berg",
+                '<a href="/boots">Produkt</a> und Leichte Bergschuhe',
+            ),
+            "/a": ("de", "Textfassung eins", content),
+            "/b": ("de", "Textfassung zwei", content.replace("word100", "updated")),
+        }
+        mapping = {
+            p: (
+                200,
+                "text/html",
+                f'<html lang="{lang}"><main><h1>{h1}</h1><p>{body}</p></main></html>',
+            )
+            for p, (lang, h1, body) in docs.items()
+        }
+        mapping["/guide"] = (
+            200,
+            "text/html",
+            mapping["/guide"][2].replace("Leichten Bergschuhe", "Leichte Bergschuhe"),
+        )
+        with patch.dict(FIXTURE, mapping):
+            cid = self.crawl(mode="list", urls=[BASE + p for p in docs])
+        with closing(storage.connect(cid)) as db:
+            rows = storage.report(
+                db, "link_suggestions", 0, 100, target=BASE + "/boots"
+            )["rows"]
+            self.assertEqual(
+                [(r["url"], r["anchor"]) for r in rows],
+                [(BASE + "/guide", "Leichte Bergschuhe")],
+            )
+            self.assertIn("Route passen", rows[0]["snippet"])
+            matched = storage.report(db, "similar_pages", 0, 10)["rows"]
+            self.assertEqual(
+                (matched[0]["url"], matched[0]["target"]), (BASE + "/a", BASE + "/b")
+            )
+            self.assertGreaterEqual(matched[0]["similarity"], 0.8)
+
+    def test_read_version_one_crawl(self):
+        from flin_crawler_mcp.server import group_crawl_issues
+
+        cid = self.crawl()
+        with closing(storage.connect(cid)) as db:
+            for name in (
+                "link_locations",
+                "alternates",
+                "render_changes",
+                "similar_pages",
+                "link_suggestions",
+                "page_text",
+            ):
+                db.execute("DROP TABLE " + name)
+            db.execute("UPDATE pages SET details='{}'")
+            db.commit()
+            with self.assertRaisesRegex(ValueError, "predates"):
+                storage.report(db, "render_changes", 0, 10)
+            self.assertTrue(storage.report(db, "issues", 0, 10)["rows"])
+        self.assertEqual(
+            group_crawl_issues(cid, code="broken_link")["rows"][0]["location"],
+            "unknown",
+        )
+
+    def test_parameter_budget_and_original_link_evidence(self):
+        listing = "<h1>Shop</h1>" + "".join(
+            f'<a href="/shop?{q}">Item</a>'
+            for q in ("utm_source=ad", "colour=red", "colour=blue")
+        )
+        with patch.dict(FIXTURE, {"/": (200, "text/html", listing)}):
+            cid = self.crawl(
+                use_sitemaps=False,
+                exclude_parameters=["utm_*"],
+                max_query_variants_per_path=1,
+            )
+        with closing(storage.connect(cid)) as db:
+            self.assertEqual(
+                {r["url"] for r in storage.report(db, "excluded_urls", 0, 10)["rows"]},
+                {BASE + "/shop?utm_source=ad", BASE + "/shop?colour=blue"},
+            )
+            self.assertEqual(len(storage.report(db, "links", 0, 10)["rows"]), 3)
+            self.assertEqual(storage.job_status(db)["pages_checked"], 2)
+
+    def test_staging_auth_is_opt_in_and_exact_origin(self):
+        from flin_crawler_mcp.network import SiteClient
+        from flin_crawler_mcp.specialists import staging_credentials
+
+        with patch.dict(
+            os.environ,
+            FLIN_STAGING_ORIGIN=BASE,
+            FLIN_STAGING_USER="fixture-user",
+            FLIN_STAGING_PASSWORD="fixture-password",
+            FLIN_STAGING_COOKIE="",
+        ):
+            auth = staging_credentials(BASE + "/")
+            with self.assertRaises(ValueError):
+                staging_credentials("https://other.example/")
+            client = SiteClient(0, lambda: None, auth)
+            with patch("flin_crawler_mcp.network.fetch", side_effect=fixture) as fetch:
+                client.get(BASE + "/")
+                self.assertIn(
+                    "Authorization", fetch.call_args.kwargs["request_headers"]
+                )
+                for dest in (
+                    "https://outside.example/",
+                    "http://fixture.example/",
+                    "https://fixture.example:8080/",
+                ):
+                    client.get(dest)
+                    self.assertNotIn("request_headers", fetch.call_args.kwargs)
+                SiteClient(0, lambda: None).get(BASE + "/")
+                self.assertNotIn("request_headers", fetch.call_args.kwargs)
+
+    def test_crux_response_url_origin_missing_and_export(self):
+        from flin_crawler_mcp.server import check_web_vitals
+
+        cid = self.crawl()
+        record = {
+            "metrics": {
+                "largest_contentful_paint": {"percentiles": {"p75": 2500}},
+                "interaction_to_next_paint": {"percentiles": {"p75": 600}},
+                "cumulative_layout_shift": {"percentiles": {"p75": "0.10"}},
+            },
+            "collectionPeriod": {"firstDate": {"year": 2026, "month": 1, "day": 1}},
+        }
+        with (
+            patch.dict(os.environ, FLIN_CRUX_API_KEY="fixture"),
+            patch(
+                "flin_crawler_mcp.specialists.crux_record",
+                side_effect=[record, None, record],
+            ),
+        ):
+            rows = check_web_vitals(cid, [BASE + "/", BASE + "/extra"])["rows"]
+            self.assertEqual(
+                [(r["scope"], r["assessment"]) for r in rows],
+                [("url", "fail"), ("origin", "fail")],
+            )
+            self.assertEqual(rows[1]["measured_url"], BASE)
+        with (
+            patch.dict(os.environ, FLIN_CRUX_API_KEY="fixture"),
+            patch("flin_crawler_mcp.specialists.crux_record", return_value=None),
+        ):
+            self.assertEqual(
+                check_web_vitals(cid, [BASE + "/"])["rows"][0]["scope"], "no_data"
+            )
+        with closing(storage.connect(cid)) as db:
+            self.assertEqual(storage.export(db, cid, "web_vitals")["rows"], 2)
+
+    def test_rich_results_required_fields_and_graph_references(self):
+        from flin_crawler_mcp.specialists import rich_result_issues
+
+        nodes = [
+            {"@type": "Product", "name": "Shoe", "offers": {"@id": "#offer"}},
+            {"@id": "#offer", "@type": "Offer", "price": 0},
+            {
+                "@type": "BreadcrumbList",
+                "itemListElement": [
+                    {"position": 2, "name": "End"},
+                    {"position": 1, "name": "Home", "item": BASE},
+                ],
+            },
+            {"@type": "Article", "headline": "Example"},
+        ]
+        self.assertEqual(list(rich_result_issues(nodes)), [])
+        issues = list(
+            rich_result_issues(
+                [
+                    {"@type": "Product"},
+                    {"@type": "BreadcrumbList", "itemListElement": []},
+                    {"@type": "Recipe", "name": "Suppe"},
+                ]
+            )
+        )
+        self.assertEqual(len(issues), 4)
+        self.assertTrue(any("itemListElement" in r[2] for r in issues))
+
+    def test_local_schedule_claim_notify_pause_and_timezone(self):
+        from flin_crawler_mcp import schedules
+        from datetime import datetime
+
+        testtime = datetime.fromisoformat("2026-03-28T12:00:00+01:00").timestamp()
+        next_run = schedules.next_due(testtime, "daily", "08:30", "Europe/Zurich", 0)
+        self.assertEqual(
+            datetime.fromtimestamp(
+                next_run, schedules.ZoneInfo("Europe/Zurich")
+            ).isoformat(),
+            "2026-03-29T08:30:00+02:00",
+        )
+        cid = self.crawl()
+        with patch.object(schedules, "wake"):
+            schedule = schedules.create(
+                cid, "weekly", "08:30", "Europe/Zurich", 0, True
+            )
+        with closing(schedules.connect()) as db, db:
+            db.execute("INSERT INTO dispatcher VALUES(1,'owner')")
+            db.execute("UPDATE schedules SET due=0")
+
+        def launch_fixture(child_id):
+            with patch("flin_crawler_mcp.network.fetch", side_effect=fixture):
+                run(child_id)
+
+        with (
+            patch("flin_crawler_mcp.jobs.launch", side_effect=launch_fixture) as launch,
+            patch.object(schedules, "desktop_notice") as notice,
+        ):
+            self.assertFalse(schedules.tick("obsolete", testtime))
+            for _ in range(4):
+                schedules.tick("owner", testtime)
+            launch.assert_called_once()
+            notice.assert_called_once()
+        info = schedules.overview(10)
+        self.assertEqual(len(info["events"]), 1)
+        self.assertNotEqual(info["events"][0]["crawl_id"], cid)
+        schedules.toggle(schedule["schedule_id"], False)
+        self.assertIsNone(schedules.overview(10)["schedules"][0]["next_run"])
+
     def test_robots_and_url_handling(self):
         rules = Rules(
             "User-agent: *\nDisallow: /\nUser-agent: flin-seo-crawler\nDisallow: /a*?x=$\nAllow: /a/b?x=$"
@@ -257,9 +610,9 @@ class Protocol(unittest.IsolatedAsyncioTestCase):
                 command=sys.executable, args=["-m", "flin_crawler_mcp.server"], env=env
             )
             if url and os.environ.get("FLIN_TEST_DESKTOP_PACKAGE"):
-                bundle = next(
-                    (Path(__file__).resolve().parents[1] / "dist").glob("*.mcpb")
-                )
+                project = Path(__file__).resolve().parents[1]
+                version = json.loads((project / "manifest.json").read_text())["version"]
+                bundle = project / "dist" / f"flin-crawler-mcp-{version}.mcpb"
                 extension = Path(folder) / "extension"
                 with zipfile.ZipFile(bundle) as archive:
                     archive.extractall(extension)
@@ -278,7 +631,7 @@ class Protocol(unittest.IsolatedAsyncioTestCase):
             ):
                 await session.initialize()
                 tools = await session.list_tools()
-                self.assertEqual(len(tools.tools), 7)
+                self.assertIn("group_crawl_issues", {tool.name for tool in tools.tools})
 
                 async def call(name, **kwargs):
                     res = await session.call_tool(name, kwargs)
@@ -305,6 +658,13 @@ class Protocol(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state["state"], "completed", state)
                 pages = await call("crawl_results", crawl_id=cid, dataset="pages")
                 self.assertEqual(pages["rows"][0]["h1"], "Rendered heading", pages)
+                changes = await call(
+                    "crawl_results", crawl_id=cid, dataset="render_changes", field="h1"
+                )
+                self.assertEqual(json.loads(changes["rows"][0]["before"]), ["Shop"])
+                self.assertEqual(
+                    json.loads(changes["rows"][0]["after"]), ["Rendered heading"]
+                )
                 file = await call("export_crawl", crawl_id=cid, dataset="pages")
                 self.assertTrue(Path(file["path"]).is_file())
 

@@ -17,7 +17,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import certifi
 
 AGENT = "flin-seo-crawler"
-USER_AGENT = f"{AGENT}/0.1 (+https://github.com/flin-agency/flin-crawler-mcp)"
+USER_AGENT = f"{AGENT}/0.2 (+https://github.com/flin-agency/flin-crawler-mcp)"
 MAX_BODY = 5 * 1024 * 1024
 REDIRECTS = {301, 302, 303, 307, 308}
 
@@ -59,9 +59,11 @@ def origin(url):
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def in_scope(url, seed):
+def in_scope(url, seed, additional_hosts=()):
     a, b = urlsplit(url), urlsplit(seed)
-    return a.hostname == b.hostname and a.port == b.port
+    return (
+        a.hostname == b.hostname or a.hostname in additional_hosts
+    ) and a.port == b.port
 
 
 def checked_address(host, port):
@@ -105,7 +107,7 @@ def tls_context():
     return context
 
 
-def fetch(url, *, metadata_only=False):
+def fetch(url, *, metadata_only=False, request_headers=None):
     parts = urlsplit(url)
     host = parts.hostname
     port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -122,7 +124,11 @@ def fetch(url, *, metadata_only=False):
         connection.request(
             "GET",
             target,
-            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Encoding": "identity",
+                **(request_headers or {}),
+            },
         )
         result = connection.getresponse()
         headers = {
@@ -236,7 +242,8 @@ class Rules:
 
 
 class SiteClient:
-    def __init__(self, delay, stopped):
+    def __init__(self, delay, stopped, credentials=None):
+        self.credentials = credentials
         self.delay, self.stopped = delay, stopped
         self.policies, self.next_at = {}, {}
         self.lock = threading.RLock()
@@ -252,6 +259,8 @@ class SiteClient:
                 self.delay,
                 self.policies[site][0].delay if site in self.policies else 0,
             )
+        if self.credentials and site == self.credentials[0]:
+            options["request_headers"] = self.credentials[1]
         return fetch(url, **options)
 
     def policy(self, url):

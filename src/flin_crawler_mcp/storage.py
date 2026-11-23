@@ -10,6 +10,8 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
+from .insights import page_changes
+
 SCHEMA = """
 CREATE TABLE job(id TEXT PRIMARY KEY, config TEXT, state TEXT, created REAL,
     finished REAL, pid INTEGER, message TEXT DEFAULT '', limited INTEGER DEFAULT 0);
@@ -23,9 +25,27 @@ CREATE TABLE issues(code TEXT, severity TEXT, url TEXT, evidence TEXT,
     PRIMARY KEY(code,url,evidence));
 CREATE INDEX issues_url ON issues(url);
 CREATE TABLE sitemap_urls(url TEXT PRIMARY KEY);
+CREATE TABLE alternates(url TEXT, code TEXT, target TEXT, channel TEXT, raw TEXT,
+    PRIMARY KEY(url,code,target,channel,raw));
+CREATE INDEX alternates_target ON alternates(target);
+CREATE TABLE link_locations(url TEXT,target TEXT,region TEXT,PRIMARY KEY(url,target,region));
+CREATE TABLE web_vitals(url TEXT,device TEXT,scope TEXT,measured_url TEXT,lcp_ms REAL,inp_ms REAL,cls REAL,
+    assessment TEXT,period TEXT,PRIMARY KEY(url,device));
+CREATE TABLE excluded_urls(url TEXT PRIMARY KEY,reason TEXT);
+CREATE TABLE page_text(url TEXT PRIMARY KEY,language TEXT,body TEXT,unlinked TEXT);
+CREATE TABLE render_changes(url TEXT,field TEXT,before TEXT,after TEXT);
+CREATE INDEX render_url ON render_changes(url,field);
+CREATE TABLE similar_pages(url TEXT,target TEXT,similarity REAL,PRIMARY KEY(url,target));
+CREATE TABLE link_suggestions(url TEXT,target TEXT,anchor TEXT,snippet TEXT,PRIMARY KEY(url,target));
 """
 TABLES = {
     "pages": "url",
+    "web_vitals": "url,device",
+    "excluded_urls": "url",
+    "render_changes": "url,field,before,after",
+    "alternates": "url,code,target,channel,raw",
+    "similar_pages": "similarity DESC,url,target",
+    "link_suggestions": "url,target",
     "links": "source,target,kind,anchor,nofollow",
     "issues": "CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,code,url,evidence",
 }
@@ -75,8 +95,8 @@ def connect(crawl_id):
     return db
 
 
-def create(config):
-    crawl_id = str(uuid.uuid4())
+def create(config, crawl_id=None):
+    crawl_id = crawl_id or str(uuid.uuid4())
     folder = directory(crawl_id)
     folder.mkdir(mode=0o700, parents=True)
     with sqlite3.connect(folder / "crawl.sqlite") as db:
@@ -157,18 +177,41 @@ def job_status(db):
     return row
 
 
-def query(db, table, *, url=None, target=None, code=None, severity=None, status=None):
+def query(
+    db,
+    table,
+    *,
+    url=None,
+    target=None,
+    code=None,
+    severity=None,
+    status=None,
+    field=None,
+):
     if table not in TABLES:
         raise ValueError("Unknown report")
+    if not db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone():
+        raise ValueError(
+            "This crawl predates this report. Run a new crawl to collect the required evidence."
+        )
     filters = {
         "source" if table == "links" else "url": url,
         "target": target,
         "code": code,
         "severity": severity,
+        "field": field,
         "status": status,
     }
     allowed = {
         "links": {"source", "target"},
+        "web_vitals": {"url"},
+        "excluded_urls": {"url"},
+        "alternates": {"url", "code", "target"},
+        "render_changes": {"url", "field"},
+        "similar_pages": {"url", "target"},
+        "link_suggestions": {"url", "target"},
         "pages": {"url", "status"},
         "issues": {"url", "code", "severity"},
     }[table]
@@ -229,7 +272,7 @@ def export(db, crawl_id, table, **filters):
     return {"path": f.name, "rows": count}
 
 
-def compare(before, after, offset, limit):
+def compare(before, after, offset, limit, view="issues", field=None, url=None):
     with closing(connect(after)) as db:
         if not (directory(before) / "crawl.sqlite").is_file():
             raise ValueError("Unknown earlier crawl")
@@ -246,6 +289,18 @@ def compare(before, after, offset, limit):
         complete_graph = (
             same and runs[1]["state"] == "completed" and not runs[1]["limited"]
         )
+        if view == "fields":
+            return {
+                **page_changes(db, offset, limit, field, url),
+                "earlier_state": runs[0]["state"],
+                "later_state": runs[1]["state"],
+                "same_settings": same,
+                "earlier_limited": bool(runs[0]["limited"]),
+                "later_limited": bool(runs[1]["limited"]),
+                "coverage": "Field changes compare observed values on URLs visited in both crawls.",
+            }
+        if field is not None or url is not None:
+            raise ValueError("The field and url filters are available for view=fields")
         diff = """WITH absent AS (
             SELECT DISTINCT o.code,o.severity,o.url,p.indexability,p.status
             FROM previous.issues o LEFT JOIN main.pages p ON p.url=o.url
@@ -255,7 +310,7 @@ def compare(before, after, offset, limit):
           UNION SELECT CASE
             WHEN indexability IS NULL OR indexability IN ('fetch_error','robots_blocked','render_error','incomplete') THEN 'not_rechecked'
             WHEN code IN ('http_4xx','http_5xx','fetch_error','robots_disallow','robots_unavailable') AND status IS NOT NULL THEN 'resolved'
-            WHEN (code LIKE 'duplicate_%' OR code IN ('broken_link','broken_resource','hreflang_missing_return',
+            WHEN (code LIKE 'duplicate_%' OR code LIKE 'hreflang_%' OR code IN ('broken_link','broken_resource','hreflang_missing_return',
                 'canonical_target_problem','hreflang_target_problem','sitemap_non_indexable','redirect_chain','redirect_loop'))
                 AND NOT ? THEN 'not_rechecked'
             WHEN indexability IN ('indexable','canonicalised','noindex','redirect') THEN 'resolved'

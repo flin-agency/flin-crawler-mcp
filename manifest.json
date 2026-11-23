@@ -2,13 +2,73 @@
   "manifest_version": "0.4",
   "name": "flin-crawler-mcp",
   "display_name": "flin SEO Crawler",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run technical SEO crawls, render JavaScript and inspect prioritised issues and link sources in Claude.",
-  "author": {"name": "flin", "url": "https://flin.agency"},
+  "author": {
+    "name": "flin",
+    "url": "https://flin.agency"
+  },
   "homepage": "https://github.com/flin-agency/flin-crawler-mcp",
   "server": {
     "type": "uv",
     "entry_point": "src/desktop.py",
-    "mcp_config": {"command": "uv", "args": ["run", "--directory", "${__dirname}", "src/desktop.py"]}
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "src/desktop.py"
+      ],
+      "env": {
+        "FLIN_CRUX_API_KEY": "${user_config.crux_api_key}",
+        "FLIN_STAGING_ORIGIN": "${user_config.staging_origin}",
+        "FLIN_STAGING_USER": "${user_config.staging_user}",
+        "FLIN_STAGING_PASSWORD": "${user_config.staging_password}",
+        "FLIN_STAGING_COOKIE": "${user_config.staging_cookie}"
+      }
+    }
+  },
+  "user_config": {
+    "crux_api_key": {
+      "type": "string",
+      "title": "Chrome UX Report API key",
+      "description": "Optional Google API key for Core Web Vitals.",
+      "required": false,
+      "default": "",
+      "sensitive": true
+    },
+    "staging_origin": {
+      "type": "string",
+      "title": "Staging origin",
+      "description": "Optional exact HTTPS origin for authenticated crawls.",
+      "required": false,
+      "default": "",
+      "sensitive": false
+    },
+    "staging_user": {
+      "type": "string",
+      "title": "Staging username",
+      "description": "Optional HTTP Basic username.",
+      "required": false,
+      "default": "",
+      "sensitive": false
+    },
+    "staging_password": {
+      "type": "string",
+      "title": "Staging password",
+      "description": "Optional HTTP Basic password.",
+      "required": false,
+      "default": "",
+      "sensitive": true
+    },
+    "staging_cookie": {
+      "type": "string",
+      "title": "Staging cookie",
+      "description": "Optional existing session cookie for the staging origin.",
+      "required": false,
+      "default": "",
+      "sensitive": true
+    }
   }
 }

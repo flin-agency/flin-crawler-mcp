@@ -7,13 +7,16 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urlsplit, unquote_plus
 from collections import deque
 from contextlib import ExitStack
-from urllib.parse import urlsplit
 
 from defusedxml import ElementTree
 
 from . import storage
+from .specialists import staging_credentials
+from .insights import content_opportunities, signal_changes
+from .international import audit_locales, declaration, header_links
 from .analysis import analyse_graph, extract
 from .network import MAX_BODY, REDIRECTS, SiteClient, in_scope, origin, url_for
 
@@ -22,12 +25,12 @@ class Stopped(Exception):
     pass
 
 
-def sitemap_entries(client, seed, db, seeds, budget):
+def sitemap_entries(client, seed, db, seeds, budget, hosts=()):
     pending = deque(seeds)
     seen = set()
     while pending and len(seen) < 50:
         link = url_for(pending.popleft(), seed)
-        if not link or link in seen or not in_scope(link, seed):
+        if not link or link in seen or not in_scope(link, seed, hosts):
             continue
         seen.add(link)
         try:
@@ -62,7 +65,7 @@ def sitemap_entries(client, seed, db, seeds, budget):
                     if entry.findtext("{*}loc")
                     else None
                 )
-                if not target or not in_scope(target, seed):
+                if not target or not in_scope(target, seed, hosts):
                     continue
                 if kind == "sitemapindex":
                     if len(pending) < 1000:
@@ -71,6 +74,30 @@ def sitemap_entries(client, seed, db, seeds, budget):
                     inserted = db.execute(
                         "INSERT OR IGNORE INTO sitemap_urls VALUES(?)", (target,)
                     ).rowcount
+                    for alternate in entry.findall(
+                        "{http://www.w3.org/1999/xhtml}link"
+                    ):
+                        if (
+                            "alternate" not in alternate.get("rel", "").lower().split()
+                            or "hreflang" not in alternate.attrib
+                        ):
+                            continue
+                        row = declaration(
+                            target,
+                            alternate.get("hreflang"),
+                            alternate.get("href"),
+                            "sitemap",
+                        )
+                        db.execute(
+                            "INSERT OR IGNORE INTO alternates VALUES(?,?,?,?,?)", row
+                        )
+                        if row[2]:
+                            db.execute(
+                                "INSERT OR IGNORE INTO links VALUES(?,?,?,?,?)",
+                                (target, row[2], "hreflang", row[1], 0),
+                            )
+                            if in_scope(row[2], seed, hosts):
+                                yield row[2]
                     budget -= inserted
                     if inserted:
                         yield target
@@ -88,8 +115,13 @@ def sitemap_entries(client, seed, db, seeds, budget):
 def perform(db, config, client, stopped, renderer=None):
     urls, max_urls = config["urls"], config["max_urls"]
     seed = urls[0]
+    hosts = config.get("additional_hosts", [])
     queue, assets, queued = deque(), deque(), set()
     limited = False
+    variants = {}
+    excluded = set()
+    patterns = config.get("exclude_parameters", [])
+    cap = config.get("max_query_variants_per_path")
 
     def schedule(url, depth, source, kind="page"):
         nonlocal limited
@@ -106,6 +138,28 @@ def perform(db, config, client, stopped, renderer=None):
             tuple(config["include_paths"])
         ):
             return
+        parts = urlsplit(url)
+        if parts.query and (patterns or cap is not None):
+            keys = {
+                unquote_plus(pair.partition("=")[0]) for pair in parts.query.split("&")
+            }
+            key = (parts.netloc, parts.path)
+            reason = None
+            if any(
+                any(k.startswith(p[:-1]) if p.endswith("*") else k == p for k in keys)
+                for p in patterns
+            ):
+                reason = "excluded query parameter"
+            elif cap is not None and variants.get(key, 0) >= cap:
+                reason = "query variant limit"
+            if reason:
+                if len(excluded) < max_urls * 5 and url not in excluded:
+                    excluded.add(url)
+                    db.execute(
+                        "INSERT OR IGNORE INTO excluded_urls VALUES(?,?)", (url, reason)
+                    )
+                return
+            variants[key] = variants.get(key, 0) + 1
         queued.add(url)
         (queue if kind == "page" else assets).append((url, depth, source, kind))
 
@@ -121,9 +175,23 @@ def perform(db, config, client, stopped, renderer=None):
             and config["mode"] == "spider"
         ):
             loaded_sitemaps = True
-            rules, _ = client.policy(seed)
-            sitemaps = rules.sitemaps or [origin(seed) + "/sitemap.xml"]
-            for dest in sitemap_entries(client, seed, db, sitemaps, max_urls * 5 + 1):
+            sitemaps = []
+            for site in dict.fromkeys(
+                [origin(u) for u in urls]
+                + [
+                    f"{urlsplit(seed).scheme}://{host}"
+                    + (f":{urlsplit(seed).port}" if urlsplit(seed).port else "")
+                    for host in hosts
+                ]
+            ):
+                rules, _ = client.policy(site)
+                sitemaps.extend(
+                    url_for(candidate, site)
+                    for candidate in (rules.sitemaps or [site + "/sitemap.xml"])
+                )
+            for dest in sitemap_entries(
+                client, seed, db, sitemaps, max_urls * 5 + 1, hosts
+            ):
                 schedule(dest, 0, "sitemap")
             db.commit()
         if not queue and not assets:
@@ -131,7 +199,7 @@ def perform(db, config, client, stopped, renderer=None):
         url, depth, source, kind = (queue or assets).popleft()
         rules, reason = client.policy(url)
         record = {"url": url, "source": source, "depth": depth}
-        findings, edges = [], []
+        findings, edges, changes, explicit_alternates = [], [], [], []
         if not rules.allows(url):
             record["indexability"] = "robots_blocked"
             findings.append(
@@ -152,13 +220,13 @@ def perform(db, config, client, stopped, renderer=None):
                     if dest:
                         edges.append((url, dest, "redirect", "", 0))
                         if config["mode"] == "spider" and (
-                            in_scope(dest, seed) or config["check_external"]
+                            in_scope(dest, seed, hosts) or config["check_external"]
                         ):
                             schedule(
                                 dest,
                                 depth,
                                 url,
-                                kind if in_scope(dest, seed) else "external",
+                                kind if in_scope(dest, seed, hosts) else "external",
                             )
                     else:
                         findings.append(
@@ -181,6 +249,20 @@ def perform(db, config, client, stopped, renderer=None):
                     or not 200 <= reply.status < 300
                 ):
                     record["indexability"] = "asset"
+                    if kind != "external" and 200 <= reply.status < 300:
+                        for dest, attrs in header_links(reply.headers.get("link", "")):
+                            if (
+                                "alternate" in attrs.get("rel", "").lower().split()
+                                and "hreflang" in attrs
+                            ):
+                                item = declaration(url, attrs["hreflang"], dest, "http")
+                                explicit_alternates.append(item)
+                                if item[2]:
+                                    edges.append((url, item[2], "hreflang", item[1], 0))
+                                    if config["mode"] == "spider" and in_scope(
+                                        item[2], seed, hosts
+                                    ):
+                                        schedule(item[2], depth + 1, url)
                 elif reply.truncated:
                     record["indexability"] = "incomplete"
                     findings.append(("html_too_large", "medium", "HTML exceeds 5 MiB"))
@@ -200,8 +282,23 @@ def perform(db, config, client, stopped, renderer=None):
                                 "fallback": "source HTML",
                             }
                     data, edges, signals = extract(
-                        markup, url, reply.headers, config["extractors"]
+                        markup,
+                        url,
+                        reply.headers,
+                        config["extractors"],
+                        config.get("page_types"),
                     )
+                    if render_info is not None and "error" not in render_info:
+                        original, source_links, _ = extract(
+                            reply.body,
+                            url,
+                            reply.headers,
+                            config["extractors"],
+                            config.get("page_types"),
+                        )
+                        changes = list(
+                            signal_changes(original, data, source_links, edges)
+                        )
                     findings.extend(signals)
                     record.update(data)
                     if render_info is not None:
@@ -221,7 +318,7 @@ def perform(db, config, client, stopped, renderer=None):
                         for _, dest, relation, _, nofollow in edges:
                             if nofollow:
                                 continue
-                            if in_scope(dest, seed):
+                            if in_scope(dest, seed, hosts):
                                 if relation in ("link", "canonical", "hreflang"):
                                     schedule(dest, depth + 1, url)
                                 elif config["check_assets"]:
@@ -232,6 +329,21 @@ def perform(db, config, client, stopped, renderer=None):
                 record["indexability"] = "fetch_error"
                 findings.append(("fetch_error", "high", str(err)))
         with db:
+            if "_text" in record:
+                db.execute("INSERT INTO page_text VALUES(?,?,?,?)", record.pop("_text"))
+                db.executemany(
+                    "INSERT OR IGNORE INTO link_locations VALUES(?,?,?)",
+                    record.pop("_locations"),
+                )
+                explicit_alternates.extend(record.pop("_alternates"))
+            db.executemany(
+                "INSERT OR IGNORE INTO alternates VALUES(?,?,?,?,?)",
+                explicit_alternates,
+            )
+            db.executemany(
+                "INSERT INTO render_changes VALUES(?,?,?,?)",
+                ((url, *c) for c in changes),
+            )
             storage.save_page(db, record)
             db.executemany("INSERT OR IGNORE INTO links VALUES(?,?,?,?,?)", edges)
             for code, severity, evidence in findings:
@@ -255,6 +367,9 @@ def perform(db, config, client, stopped, renderer=None):
         )
         stopped()
         analyse_graph(db, storage.issue)
+        audit_locales(db, storage.issue)
+    content_opportunities(db, stopped)
+    db.commit()
 
 
 def run(crawl_id):
@@ -266,13 +381,21 @@ def run(crawl_id):
 
         try:
             stopped()
-            db.execute(
+            claimed = db.execute(
                 "UPDATE job SET pid=?,state='running' WHERE state='queued'",
                 (os.getpid(),),
-            )
+            ).rowcount
             db.commit()
+            if not claimed:
+                stopped()
+                return
             config = json.loads(db.execute("SELECT config FROM job").fetchone()[0])
-            client = SiteClient(config["delay_ms"] / 1000, stopped)
+            credentials = (
+                staging_credentials(config["urls"][0])
+                if config.get("staging_auth")
+                else None
+            )
+            client = SiteClient(config["delay_ms"] / 1000, stopped, credentials)
             with ExitStack() as resources:
                 renderer = None
                 if config["render_js"]:

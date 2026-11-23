@@ -1,12 +1,6 @@
 """Local MCP entry point. Crawls outlive the stdio session."""
 
-import os
-import subprocess
-import sys
-import threading
-import time
 from contextlib import closing
-from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
@@ -14,7 +8,9 @@ import soupsieve
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from . import storage
+from . import storage, jobs, schedules
+from .insights import group_issues
+from .specialists import measure_vitals, staging_credentials
 from .network import in_scope, url_for
 
 mcp = FastMCP(
@@ -25,7 +21,17 @@ mcp = FastMCP(
         "Respect crawl coverage and distinguish technical indexability from actual search-engine indexing."
     ),
 )
-Dataset = Literal["pages", "issues", "links"]
+Dataset = Literal[
+    "pages",
+    "issues",
+    "links",
+    "render_changes",
+    "alternates",
+    "similar_pages",
+    "web_vitals",
+    "excluded_urls",
+    "link_suggestions",
+]
 Offset = Annotated[int, Field(ge=0)]
 Limit = Annotated[int, Field(ge=1, le=100)]
 
@@ -46,16 +52,43 @@ def start_crawl(
     include_paths: list[str] | None = None,
     exclude_paths: list[str] | None = None,
     extractors: dict[str, str] | None = None,
+    additional_hosts: list[str] | None = None,
+    page_types: dict[str, str] | None = None,
+    exclude_parameters: list[str] | None = None,
+    max_query_variants_per_path: Annotated[int, Field(ge=0, le=25000)] | None = None,
+    staging_auth: bool = False,
 ) -> dict:
     """Start a background SEO crawl. Spider follows same-host links; list checks only supplied URLs.
     max_urls includes assets and optional external checks. Path filters are case-sensitive prefixes.
     render_js runs Chrome/Chromium before extraction; render_wait_ms is the post-DOM wait.
+    additional_hosts allows explicit language hosts. page_types maps template labels to path prefixes.
+    exclude_parameters accepts exact keys or trailing wildcards, e.g. utm_*. A variant cap applies per hostname and path.
+    staging_auth uses the operator-configured HTTPS origin and credentials.
     extractors maps labels to CSS selectors and returns matching text. Use crawl_status with the returned ID.
     """
     start = url_for(start_url)
+    hosts = []
+    for name in additional_hosts or []:
+        if not name or any(c in name for c in "/:@?#*"):
+            raise ValueError("additional_hosts accepts exact hostnames only")
+        value = url_for("https://" + name)
+        if not value:
+            raise ValueError("Invalid additional hostname")
+        hosts.append(urlsplit(value).hostname)
+    if any(
+        not label.strip() or not prefix.startswith("/")
+        for label, prefix in (page_types or {}).items()
+    ):
+        raise ValueError("page_types maps a label to a path prefix beginning with /")
     seeds = [url_for(item) for item in (urls or [])]
-    if not start or any(not u or not in_scope(u, start) for u in seeds):
-        raise ValueError("Supply HTTP(S) seed URLs on the same hostname and port")
+    if not start or any(not u or not in_scope(u, start, hosts) for u in seeds):
+        raise ValueError(
+            "Supply HTTP(S) seed URLs within the configured hostnames and port"
+        )
+    if staging_auth:
+        staging_credentials(start)
+    if any(not p or "*" in p[:-1] for p in (exclude_parameters or [])):
+        raise ValueError("Use exact query parameter names or a trailing wildcard")
     seeds = list(dict.fromkeys([start, *seeds]))
     if len(seeds) > max_urls:
         raise ValueError("max_urls must cover all supplied seeds")
@@ -75,6 +108,11 @@ def start_crawl(
         soupsieve.compile(selector)
     config = dict(
         urls=seeds,
+        exclude_parameters=exclude_parameters or [],
+        max_query_variants_per_path=max_query_variants_per_path,
+        staging_auth=staging_auth,
+        additional_hosts=sorted(set(hosts)),
+        page_types=page_types or {},
         mode=mode,
         max_urls=max_urls,
         max_depth=max_depth,
@@ -89,36 +127,7 @@ def start_crawl(
         extractors=extractors or {},
     )
     crawl_id = storage.create(config)
-    env = dict(os.environ)
-    # Source checkouts, wheel installs and the extracted Desktop bundle use the same worker.
-    env["PYTHONPATH"] = os.pathsep.join(
-        filter(None, (str(Path(__file__).resolve().parents[1]), env.get("PYTHONPATH")))
-    )
-    options = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        if os.name == "nt"
-        else {"start_new_session": True}
-    )
-    with closing(storage.connect(crawl_id)) as db:
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "flin_crawler_mcp.worker", crawl_id],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **options,
-            )
-        except OSError as err:
-            with db:
-                db.execute(
-                    "UPDATE job SET state='failed',message=?,finished=?",
-                    (str(err), time.time()),
-                )
-            raise
-        threading.Thread(target=proc.wait, daemon=True).start()
-        with db:
-            db.execute("UPDATE job SET pid=? WHERE pid IS NULL", (proc.pid,))
+    jobs.launch(crawl_id)
     return {"crawl_id": crawl_id, "status_tool": "crawl_status"}
 
 
@@ -171,8 +180,11 @@ def crawl_results(
     status: int | None = None,
     offset: Offset = 0,
     limit: Limit = 20,
+    field: str | None = None,
 ) -> dict:
     """Page through findings, pages or links. For incoming links set dataset=links and target to the broken URL.
+    render_changes compares source HTML to the DOM (filter by field). alternates includes annotation channel.
+    similar_pages ranks approximate text matches; link_suggestions contains an existing unlinked snippet.
     url filters the source on links. code/severity filter issues; status filters pages. Repeat with next_offset.
     """
     with closing(storage.connect(crawl_id)) as db:
@@ -186,6 +198,7 @@ def crawl_results(
             code=code,
             severity=severity,
             status=status,
+            field=field,
         )
 
 
@@ -198,6 +211,7 @@ def export_crawl(
     code: str | None = None,
     severity: Literal["high", "medium", "low", "info"] | None = None,
     status: int | None = None,
+    field: str | None = None,
 ) -> dict:
     """Write all matching report rows to a local Excel-compatible CSV and return its absolute path."""
     with closing(storage.connect(crawl_id)) as db:
@@ -210,18 +224,92 @@ def export_crawl(
             code=code,
             severity=severity,
             status=status,
+            field=field,
         )
 
 
 @mcp.tool()
 def compare_crawls(
-    earlier_id: str, later_id: str, offset: Offset = 0, limit: Limit = 50
+    earlier_id: str,
+    later_id: str,
+    offset: Offset = 0,
+    limit: Limit = 50,
+    view: Literal["issues", "fields"] = "issues",
+    field: str | None = None,
+    url: str | None = None,
 ) -> dict:
-    """Compare issue types per URL across two crawls. Distinguishes resolved issues from URLs not rechecked."""
-    return storage.compare(earlier_id, later_id, offset, limit)
+    """Compare issues or inspect field changes with before/after evidence. view=fields accepts an exact URL and field,
+    e.g. title, canonical, h1, robots, status, indexability, depth, link_added or link_removed."""
+    return storage.compare(earlier_id, later_id, offset, limit, view, field, url)
+
+
+@mcp.tool()
+def group_crawl_issues(
+    crawl_id: str,
+    group_by: list[Literal["cause", "location", "language", "page_type", "directory"]]
+    | None = None,
+    code: str | None = None,
+    severity: Literal["high", "medium", "low", "info"] | None = None,
+    offset: Offset = 0,
+    limit: Limit = 20,
+) -> dict:
+    """Rank issue groups by severity and distinct affected URLs. Group by shared target, link location,
+    language, page type or directory. Returns representative evidence; shared templates are a hypothesis."""
+    with closing(storage.connect(crawl_id)) as db:
+        return group_issues(
+            db,
+            ["cause", "location"] if group_by is None else group_by,
+            offset,
+            limit,
+            code,
+            severity,
+        )
+
+
+@mcp.tool()
+def check_web_vitals(
+    crawl_id: str,
+    urls: list[str],
+    device: Literal["PHONE", "DESKTOP", "TABLET", "ALL"] = "PHONE",
+    origin_fallback: bool = True,
+) -> dict:
+    """Look up public crawled URLs in the Google Chrome UX Report (CrUX) field dataset.
+    Sends up to 20 URLs to Google on request. Persists p75 LCP/INP/CLS, device, period and URL/origin scope."""
+    with closing(storage.connect(crawl_id)) as db, db:
+        return measure_vitals(db, urls, device, origin_fallback)
+
+
+@mcp.tool()
+def schedule_crawl(
+    crawl_id: str,
+    local_time: str,
+    timezone: str,
+    cadence: Literal["daily", "weekly"] = "weekly",
+    weekday: Annotated[int, Field(ge=0, le=6)] = 0,
+    desktop_notification: bool = True,
+) -> dict:
+    """Repeat an existing crawl's settings at HH:MM in an IANA timezone. Weekly weekdays start with Monday=0.
+    Starts a detached local scheduler. The computer must be awake; missed slots coalesce into one run."""
+    return schedules.create(
+        crawl_id, cadence, local_time, timezone, weekday, desktop_notification
+    )
+
+
+@mcp.tool()
+def crawl_schedules(limit: Limit = 25) -> dict:
+    """List schedules, next local start time, and recent completion notifications with the resulting crawl IDs."""
+    return schedules.overview(limit)
+
+
+@mcp.tool()
+def set_schedule_enabled(schedule_id: str, enabled: bool) -> dict:
+    """Pause or resume a local recurring crawl schedule."""
+    return schedules.toggle(schedule_id, enabled)
 
 
 def main():
+    if (storage.root() / "schedules.sqlite").exists():
+        schedules.wake()
     mcp.run(transport="stdio")
 
 
