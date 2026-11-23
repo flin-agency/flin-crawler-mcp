@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 SCHEMA = """
@@ -26,7 +27,7 @@ CREATE TABLE sitemap_urls(url TEXT PRIMARY KEY);
 TABLES = {
     "pages": "url",
     "links": "source,target,kind,anchor,nofollow",
-    "issues": "severity,code,url,evidence",
+    "issues": "CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,code,url,evidence",
 }
 PAGE_COLUMNS = (
     "url",
@@ -113,7 +114,24 @@ def job_status(db):
         missing = not pid and time.time() - row["created"] > 60
         if pid:
             try:
-                os.kill(pid, 0)
+                if os.name == "nt":
+                    import _winapi
+
+                    try:
+                        handle = _winapi.OpenProcess(0x1000, False, pid)
+                    except OSError as exc:
+                        if (
+                            exc.winerror != 87
+                        ):  # ERROR_INVALID_PARAMETER for an absent PID
+                            raise
+                        missing = True
+                    else:
+                        try:
+                            missing = _winapi.GetExitCodeProcess(handle) != 259
+                        finally:
+                            _winapi.CloseHandle(handle)
+                else:
+                    os.kill(pid, 0)
             except ProcessLookupError:
                 missing = True
             except PermissionError:
@@ -128,6 +146,9 @@ def job_status(db):
     row["config"] = json.loads(row["config"])
     row["limited"] = bool(row["limited"])
     row["pages_checked"] = db.execute("SELECT count(*) FROM pages").fetchone()[0]
+    row["coverage"] = dict(
+        db.execute("SELECT indexability,count(*) FROM pages GROUP BY indexability")
+    )
     row["top_issues"] = [
         dict(r)
         for r in db.execute("""SELECT code,severity,count(DISTINCT url) AS affected_urls FROM issues
@@ -209,7 +230,7 @@ def export(db, crawl_id, table, **filters):
 
 
 def compare(before, after, offset, limit):
-    with connect(after) as db:
+    with closing(connect(after)) as db:
         if not (directory(before) / "crawl.sqlite").is_file():
             raise ValueError("Unknown earlier crawl")
         db.execute(
@@ -221,24 +242,35 @@ def compare(before, after, offset, limit):
             )
             for schema in ("previous", "main")
         ]
-        diff = """SELECT 'new' change, n.code, n.severity, n.url FROM main.issues n
+        same = json.loads(runs[0]["config"]) == json.loads(runs[1]["config"])
+        complete_graph = (
+            same and runs[1]["state"] == "completed" and not runs[1]["limited"]
+        )
+        diff = """WITH absent AS (
+            SELECT DISTINCT o.code,o.severity,o.url,p.indexability,p.status
+            FROM previous.issues o LEFT JOIN main.pages p ON p.url=o.url
+            WHERE NOT EXISTS (SELECT 1 FROM main.issues n WHERE n.code=o.code AND n.url=o.url)
+        ) SELECT 'new' change, n.code,n.severity,n.url FROM main.issues n
           WHERE NOT EXISTS (SELECT 1 FROM previous.issues o WHERE o.code=n.code AND o.url=n.url)
-          UNION SELECT 'resolved', o.code, o.severity, o.url FROM previous.issues o
-          JOIN main.pages p ON p.url=o.url AND p.indexability NOT IN ('fetch_error','robots_blocked','render_error')
-          WHERE NOT EXISTS (SELECT 1 FROM main.issues n WHERE n.code=o.code AND n.url=o.url)
-          UNION SELECT 'not_rechecked', o.code, o.severity, o.url FROM previous.issues o
-          WHERE NOT EXISTS (SELECT 1 FROM main.pages p WHERE p.url=o.url AND p.indexability NOT IN ('fetch_error','robots_blocked','render_error'))
-          AND NOT EXISTS (SELECT 1 FROM main.issues n WHERE n.code=o.code AND n.url=o.url)"""
+          UNION SELECT CASE
+            WHEN indexability IS NULL OR indexability IN ('fetch_error','robots_blocked','render_error','incomplete') THEN 'not_rechecked'
+            WHEN code IN ('http_4xx','http_5xx','fetch_error','robots_disallow','robots_unavailable') AND status IS NOT NULL THEN 'resolved'
+            WHEN (code LIKE 'duplicate_%' OR code IN ('broken_link','broken_resource','hreflang_missing_return',
+                'canonical_target_problem','hreflang_target_problem','sitemap_non_indexable','redirect_chain','redirect_loop'))
+                AND NOT ? THEN 'not_rechecked'
+            WHEN indexability IN ('indexable','canonicalised','noindex','redirect') THEN 'resolved'
+            ELSE 'not_rechecked' END, code,severity,url FROM absent"""
         results = [
             dict(r)
             for r in db.execute(
-                diff + " ORDER BY 1,2,4 LIMIT ? OFFSET ?", (limit + 1, offset)
+                diff + " ORDER BY 1,2,4 LIMIT ? OFFSET ?",
+                (complete_graph, limit + 1, offset),
             )
         ]
         return {
             "earlier_state": runs[0]["state"],
             "later_state": runs[1]["state"],
-            "same_settings": runs[0]["config"] == runs[1]["config"],
+            "same_settings": same,
             "later_limited": bool(runs[1]["limited"]),
             "rows": results[:limit],
             "next_offset": offset + limit if len(results) > limit else None,

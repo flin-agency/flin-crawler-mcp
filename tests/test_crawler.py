@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -158,6 +159,20 @@ class UnitCrawl(unittest.TestCase):
             storage.compare(before, repaired, 0, 100)["rows"],
         )
 
+    def test_uncrawled_link_target_is_not_a_fix(self):
+        before = self.crawl()
+        after = self.crawl(mode="list")
+        rows = storage.compare(before, after, 0, 100)["rows"]
+        self.assertIn(
+            {
+                "url": BASE + "/",
+                "code": "broken_link",
+                "severity": "high",
+                "change": "not_rechecked",
+            },
+            rows,
+        )
+
     def test_url_budget_and_cancellation(self):
         with closing(storage.connect(self.crawl(max_urls=1))) as db:
             job = storage.job_status(db)
@@ -241,6 +256,22 @@ class Protocol(unittest.IsolatedAsyncioTestCase):
             params = StdioServerParameters(
                 command=sys.executable, args=["-m", "flin_crawler_mcp.server"], env=env
             )
+            if url and os.environ.get("FLIN_TEST_DESKTOP_PACKAGE"):
+                bundle = next(
+                    (Path(__file__).resolve().parents[1] / "dist").glob("*.mcpb")
+                )
+                extension = Path(folder) / "extension"
+                with zipfile.ZipFile(bundle) as archive:
+                    archive.extractall(extension)
+                manifest = json.loads((extension / "manifest.json").read_text())
+                entry = manifest["server"]["mcp_config"]
+                args = [
+                    a.replace("${__dirname}", str(extension)) for a in entry["args"]
+                ]
+                env.pop("PYTHONPATH", None)
+                params = StdioServerParameters(
+                    command=entry["command"], args=args, env=env
+                )
             async with (
                 stdio_client(params) as (reader, writer),
                 ClientSession(reader, writer) as session,

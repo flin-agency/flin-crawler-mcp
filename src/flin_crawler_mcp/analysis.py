@@ -10,7 +10,14 @@ from .network import url_for
 
 
 def extract(markup, url, headers, selectors):
-    soup = BeautifulSoup(markup, "html.parser")
+    encoding = re.search(
+        r"""charset\s*=\s*["']?([\w.-]+)""", headers.get("content-type", ""), re.I
+    )
+    soup = BeautifulSoup(
+        markup,
+        "html.parser",
+        from_encoding=encoding[1] if encoding and isinstance(markup, bytes) else None,
+    )
     base_tag = soup.find("base", href=True)
     base = (url_for(base_tag["href"], url) if base_tag else None) or url
 
@@ -43,7 +50,9 @@ def extract(markup, url, headers, selectors):
             ("max-", "unavailable_after")
         ):
             agent, part = part.split(":", 1)
-        if agent is None or agent.strip().lower() in ("googlebot", "*"):
+        if part.strip() and (
+            agent is None or agent.strip().lower() in ("googlebot", "*")
+        ):
             robots.append(part.strip())
     directives = set(re.split(r"[\s,]+", " ".join(robots).lower()))
     noindex = bool({"noindex", "none"} & directives)

@@ -25,7 +25,9 @@ REDIRECTS = {301, 302, 303, 307, 308}
 def url_for(value, base=""):
     """Return a normalised HTTP URL, or None for non-web references."""
     try:
-        item = urlsplit(urljoin(base, str(value).strip()))
+        if not isinstance(value, str) or not value.strip():
+            return None
+        item = urlsplit(urljoin(base, value.strip()))
         if (
             item.scheme not in ("http", "https")
             or not item.hostname
@@ -248,9 +250,7 @@ class SiteClient:
             self.stopped()
             self.next_at[site] = time.monotonic() + max(
                 self.delay,
-                self.policies.get(site, (None,))[0].delay
-                if site in self.policies
-                else 0,
+                self.policies[site][0].delay if site in self.policies else 0,
             )
         return fetch(url, **options)
 
