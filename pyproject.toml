@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flin-crawler-mcp"
+version = "0.1.0"
+description = "Run technical SEO crawls and query the findings from Claude Desktop"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "flin"}]
+dependencies = [
+    "mcp>=1.26,<2",
+    "beautifulsoup4>=4.13,<5",
+    "playwright>=1.58,<2",
+    "defusedxml>=0.7.1,<1",
+    "certifi>=2024.2.2",
+]
+
+[project.urls]
+Repository = "https://github.com/flin-agency/flin-crawler-mcp"
+
+[project.scripts]
+flin-crawler-mcp = "flin_crawler_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flin_crawler_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "scripts", "manifest.json", "README.md", "pyproject.toml"]
