@@ -4,7 +4,7 @@ Ask Claude Desktop to crawl a website, then inspect the URLs and source links be
 
 ## Install in Claude Desktop
 
-Open the **flin-crawler-mcp-0.2.1.mcpb** file in Claude Desktop and select **Install**. Use a current Claude Desktop version with UV extension support. On first launch Claude downloads Python and the Python dependencies. For rendered crawls, install Google Chrome or use Playwright Chromium. The crawler uses an isolated browser profile.
+Open the **flin-crawler-mcp-0.2.2.mcpb** file in Claude Desktop and select **Install**. Use a current Claude Desktop version with UV extension support. On first launch Claude downloads Python and the Python dependencies. For rendered crawls, install Google Chrome or use Playwright Chromium. The crawler uses an isolated browser profile.
 
 After a release, download the extension from [GitHub Releases](https://github.com/flin-agency/flin-crawler-mcp/releases). To build the same extension from a checkout, run `python3 scripts/build_desktop.py`. The file appears in `dist/`.
 
@@ -23,6 +23,10 @@ Alternatively, after PyPI publication use this Claude Desktop developer configur
 
 ## Ask Claude
 
+For a technical SEO audit, ask «Mach ein technisches SEO-Audit für https://example.org mit maximal 300 URLs. Gib mir die drei wichtigsten Tickets mit Belegen und Abnahmekriterien.» For a follow-up, ask «Prüfe anhand dieser beiden Crawl-IDs, welche Tickets nach dem Release behoben sind.»
+
+The extension includes the [flin audit skill](src/flin_crawler_mcp/skills/flin-seo-audit/SKILL.md). The server guides the assistant to retrieve it for audits through `get_audit_workflow`. Installing the extension is sufficient.
+
 - «Crawle https://example.org mit maximal 300 URLs. Zeige mir die fünf wichtigsten technischen SEO-Probleme mit Beispielen.»
 - «Welche Seiten verlinken auf eine 404-URL? Zeig mir Quellseite, Ziel und Ankertext.»
 - «Rendere die Produktseiten mit JavaScript. Prüfe Canonicals, H1 und die im DOM vorhandenen Schema.org-Typen.»
@@ -30,6 +34,7 @@ Alternatively, after PyPI publication use this Claude Desktop developer configur
 
 | Tool | What it returns |
 | --- | --- |
+| `get_audit_workflow` | The audit procedure for checking scope, grouping evidence and writing verifiable tickets. |
 | `start_crawl` | Background job ID. Spider mode follows links. List mode checks the seed and supplied URLs only. |
 | `check_robots` | Checks one URL against its origin's robots.txt with the crawler's own GET. Returns each HTTP status, redirect target, rules decision and declared sitemaps. |
 | `crawl_status` | Progress, completion state, coverage limit, issue counts and configuration. |

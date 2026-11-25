@@ -847,9 +847,17 @@ class Protocol(unittest.IsolatedAsyncioTestCase):
                 stdio_client(params) as (reader, writer),
                 ClientSession(reader, writer) as session,
             ):
-                await session.initialize()
+                initialized = await session.initialize()
+                self.assertIn("get_audit_workflow", initialized.instructions)
                 tools = await session.list_tools()
                 self.assertIn("group_crawl_issues", {tool.name for tool in tools.tools})
+                workflow = await session.call_tool("get_audit_workflow", {})
+                self.assertFalse(workflow.isError, workflow.content)
+                skill = workflow.content[0].text
+                self.assertTrue(skill.startswith("# Technisches SEO-Audit"), skill)
+                for tool in ("crawl_status", "group_crawl_issues", "crawl_results", "compare_crawls"):
+                    self.assertIn(tool, skill)
+                    self.assertIn(tool, {item.name for item in tools.tools})
 
                 async def call(name, **kwargs):
                     res = await session.call_tool(name, kwargs)
