@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flin-crawler-mcp"
-version = "0.2.0"
+version = "0.2.2"
 description = "Run technical SEO crawls and query the findings from Claude Desktop"
 readme = "README.md"
 requires-python = ">=3.11"

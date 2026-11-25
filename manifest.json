@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "flin-crawler-mcp",
   "display_name": "flin SEO Crawler",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Run technical SEO crawls, render JavaScript and inspect prioritised issues and link sources in Claude.",
   "author": {
     "name": "flin",

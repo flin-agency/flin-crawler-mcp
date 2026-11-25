@@ -20,6 +20,7 @@ AGENT = "flin-seo-crawler"
 USER_AGENT = f"{AGENT}/0.2 (+https://github.com/flin-agency/flin-crawler-mcp)"
 MAX_BODY = 5 * 1024 * 1024
 REDIRECTS = {301, 302, 303, 307, 308}
+MAX_ROBOTS_REDIRECTS = 5
 
 
 def url_for(value, base=""):
@@ -125,6 +126,9 @@ def fetch(url, *, metadata_only=False, request_headers=None):
             "GET",
             target,
             headers={
+                # The pinned socket uses HTTPConnection even for TLS. Its automatic
+                # Host header would append :443 to a canonical HTTPS authority.
+                "Host": parts.netloc,
                 "User-Agent": USER_AGENT,
                 "Accept-Encoding": "identity",
                 **(request_headers or {}),
@@ -241,9 +245,37 @@ class Rules:
         )[1]
 
 
+@dataclass
+class RobotsPolicy:
+    rules: Rules
+    outcome: str
+    action: str
+    hops: list
+    reason: str = ""
+
+    def report(self):
+        return {
+            "url": self.hops[0]["url"],
+            "outcome": self.outcome,
+            "action": self.action,
+            "hops": self.hops,
+            "reason": self.reason,
+        }
+
+
 class SiteClient:
-    def __init__(self, delay, stopped, credentials=None):
+    def __init__(
+        self,
+        delay,
+        stopped,
+        credentials=None,
+        *,
+        redirect_fallback_origin=None,
+        on_policy=None,
+    ):
         self.credentials = credentials
+        self.redirect_fallback_origin = redirect_fallback_origin
+        self.on_policy = on_policy
         self.delay, self.stopped = delay, stopped
         self.policies, self.next_at = {}, {}
         self.lock = threading.RLock()
@@ -257,7 +289,7 @@ class SiteClient:
             self.stopped()
             self.next_at[site] = time.monotonic() + max(
                 self.delay,
-                self.policies[site][0].delay if site in self.policies else 0,
+                self.policies[site].rules.delay if site in self.policies else 0,
             )
         if self.credentials and site == self.credentials[0]:
             options["request_headers"] = self.credentials[1]
@@ -267,33 +299,73 @@ class SiteClient:
         site = origin(url)
         with self.lock:
             if site not in self.policies:
-                robots = site + "/robots.txt"
-                try:
-                    for _ in range(6):
-                        reply = self.get(robots)
-                        if reply.status not in REDIRECTS:
-                            break
-                        robots = url_for(reply.headers.get("location", ""), robots)
-                        if not robots:
-                            raise ValueError("Invalid robots.txt redirect")
-                    if (
-                        reply.status in (401, 403, 429)
-                        or reply.status >= 500
-                        or reply.status in REDIRECTS
-                    ):
-                        raise ValueError(f"robots.txt HTTP {reply.status}")
-                    rules = (
-                        Rules(reply.body.decode("utf-8", "replace"))
-                        if 200 <= reply.status < 300
-                        else Rules()
-                    )
-                    self.policies[site] = (rules, "")
-                    self.next_at[site] = max(
-                        self.next_at.get(site, 0), time.monotonic() + rules.delay
-                    )
-                except (ValueError, OSError, http.client.HTTPException) as err:
-                    self.policies[site] = (
-                        Rules("User-agent: *\nDisallow: /"),
-                        str(err),
-                    )
+                policy = self._load_policy(site)
+                self.policies[site] = policy
+                self.next_at[site] = max(
+                    self.next_at.get(site, 0), time.monotonic() + policy.rules.delay
+                )
+                if self.on_policy:
+                    self.on_policy(policy)
             return self.policies[site]
+
+    def _load_policy(self, site):
+        url = site + "/robots.txt"
+        hops = []
+        seen = set()
+
+        def failure(outcome, reason):
+            if site == self.redirect_fallback_origin and outcome in {
+                "redirect_loop",
+                "redirect_limit",
+            }:
+                return RobotsPolicy(
+                    Rules(), outcome, "continue_without_rules", hops, reason
+                )
+            return RobotsPolicy(
+                Rules("User-agent: *\nDisallow: /"), outcome, "block", hops, reason
+            )
+
+        while True:
+            seen.add(url)
+            hop = {"url": url, "status": None}
+            hops.append(hop)
+            try:
+                reply = self.get(url)
+            except (ValueError, OSError, http.client.HTTPException) as err:
+                return failure("fetch_error", f"{url}: {err}")
+            hop["status"] = reply.status
+            if reply.status not in REDIRECTS:
+                break
+            location = reply.headers.get("location")
+            target = url_for(location, url)
+            if not target:
+                reason = "invalid Location" if location else "missing Location"
+                return failure(
+                    "invalid_redirect", f"{url}: HTTP {reply.status}, {reason}"
+                )
+            hop.update(location=location, target=target)
+            if target in seen:
+                return failure(
+                    "redirect_loop",
+                    f"{url}: HTTP {reply.status} redirects back to {target}",
+                )
+            if len(hops) > MAX_ROBOTS_REDIRECTS:
+                return failure(
+                    "redirect_limit",
+                    f"{url}: HTTP {reply.status} to {target} exceeds the {MAX_ROBOTS_REDIRECTS}-redirect limit",
+                )
+            url = target
+
+        if 200 <= reply.status < 300:
+            text = reply.body.decode("utf-8-sig", "replace")
+            if re.match(
+                r"\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", text, re.I
+            ):
+                return failure(
+                    "html_response",
+                    f"{url}: HTTP {reply.status} returned an HTML document for robots.txt",
+                )
+            return RobotsPolicy(Rules(text), "loaded", "apply_rules", hops)
+        if 400 <= reply.status < 500 and reply.status not in (401, 403, 429):
+            return RobotsPolicy(Rules(), "unavailable_4xx", "allow", hops)
+        return failure("http_error", f"{url}: robots.txt HTTP {reply.status}")

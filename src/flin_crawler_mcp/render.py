@@ -96,8 +96,7 @@ class Renderer:
                         used_document = True
                         reply = document
                     else:
-                        rules, _ = self.client.policy(target)
-                        if not rules.allows(target):
+                        if not self.client.policy(target).rules.allows(target):
                             route.abort()
                             return
                         reply = self.client.get(target)
@@ -107,7 +106,7 @@ class Renderer:
                             break
                         location = reply.headers.get("location")
                         target = url_for(location, target) if location else None
-                        if not target or not self.client.policy(target)[0].allows(
+                        if not target or not self.client.policy(target).rules.allows(
                             target
                         ):
                             raise ValueError("Unavailable subresource redirect")

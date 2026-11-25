@@ -22,6 +22,7 @@ def build(tag=None):
         for name in ("manifest.json", "pyproject.toml", "README.md", "src/desktop.py")
     ]
     files.extend(sorted((ROOT / "src/flin_crawler_mcp").glob("*.py")))
+    files.append(ROOT / "src/flin_crawler_mcp/skills/flin-seo-audit/SKILL.md")
     (ROOT / "dist").mkdir(exist_ok=True)
     path = ROOT / "dist" / f"flin-crawler-mcp-{version}.mcpb"
     with zipfile.ZipFile(path, "w") as bundle:
