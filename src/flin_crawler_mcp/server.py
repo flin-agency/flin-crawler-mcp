@@ -11,7 +11,7 @@ from pydantic import Field
 from . import storage, jobs, schedules
 from .insights import group_issues
 from .specialists import measure_vitals, staging_credentials
-from .network import in_scope, url_for
+from .network import USER_AGENT, SiteClient, in_scope, url_for
 
 mcp = FastMCP(
     "flin SEO Crawler",
@@ -23,6 +23,7 @@ mcp = FastMCP(
 )
 Dataset = Literal[
     "pages",
+    "robots",
     "issues",
     "links",
     "render_changes",
@@ -57,9 +58,14 @@ def start_crawl(
     exclude_parameters: list[str] | None = None,
     max_query_variants_per_path: Annotated[int, Field(ge=0, le=25000)] | None = None,
     staging_auth: bool = False,
+    max_resource_urls: Annotated[int, Field(ge=0, le=25000)] | None = None,
+    allow_robots_redirect_failure: bool = False,
 ) -> dict:
     """Start a background SEO crawl. Spider follows same-host links; list checks only supplied URLs.
-    max_urls includes assets and optional external checks. Path filters are case-sensitive prefixes.
+    max_urls is shared by default. Set max_resource_urls to budget linked assets and external checks separately.
+    With separate budgets max_urls counts page candidates, including redirects and errors. Path filters are case-sensitive prefixes.
+    allow_robots_redirect_failure continues on the seed origin only after a robots redirect loop or a sixth redirect.
+    The default blocks on these errors. Inspect seed_robots in crawl_status for the HTTP hops and decision.
     render_js runs Chrome/Chromium before extraction; render_wait_ms is the post-DOM wait.
     additional_hosts allows explicit language hosts. page_types maps template labels to path prefixes.
     exclude_parameters accepts exact keys or trailing wildcards, e.g. utm_*. A variant cap applies per hostname and path.
@@ -126,14 +132,36 @@ def start_crawl(
         exclude_paths=exclude_paths or [],
         extractors=extractors or {},
     )
+    if max_resource_urls is not None:
+        config["max_resource_urls"] = max_resource_urls
+    if allow_robots_redirect_failure:
+        config["allow_robots_redirect_failure"] = True
     crawl_id = storage.create(config)
     jobs.launch(crawl_id)
     return {"crawl_id": crawl_id, "status_tool": "crawl_status"}
 
 
 @mcp.tool()
+def check_robots(url: str, staging_auth: bool = False) -> dict:
+    """Check robots.txt for one HTTP(S) URL with the crawler's own GET and user-agent.
+    Returns the HTTP hops, Location headers, decision for that URL and discovered sitemaps."""
+    target = url_for(url)
+    if not target:
+        raise ValueError("Supply an HTTP(S) URL")
+    credentials = staging_credentials(target) if staging_auth else None
+    policy = SiteClient(0.3, lambda: None, credentials).policy(target)
+    return {
+        **policy.report(),
+        "checked_url": target,
+        "user_agent": USER_AGENT,
+        "crawl_allowed": policy.rules.allows(target),
+        "sitemaps": policy.rules.sitemaps,
+    }
+
+
+@mcp.tool()
 def crawl_status(crawl_id: str) -> dict:
-    """Get state, coverage, saved settings and issue counts ranked by severity. Graph checks finish at crawl completion."""
+    """Get state, coverage, seed robots.txt trace, checked URL counts by kind, saved settings and issue counts."""
     with closing(storage.connect(crawl_id)) as db:
         return storage.job_status(db)
 
@@ -183,6 +211,7 @@ def crawl_results(
     field: str | None = None,
 ) -> dict:
     """Page through findings, pages or links. For incoming links set dataset=links and target to the broken URL.
+    robots shows the requests and rule decision per origin. Filter url by the initial robots.txt URL.
     render_changes compares source HTML to the DOM (filter by field). alternates includes annotation channel.
     similar_pages ranks approximate text matches; link_suggestions contains an existing unlinked snippet.
     url filters the source on links. code/severity filter issues; status filters pages. Repeat with next_offset.

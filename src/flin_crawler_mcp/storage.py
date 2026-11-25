@@ -11,13 +11,17 @@ from contextlib import closing
 from pathlib import Path
 
 from .insights import page_changes
+from .network import origin
 
-SCHEMA = """
+ROBOTS_SCHEMA = """CREATE TABLE IF NOT EXISTS robots(url TEXT PRIMARY KEY, outcome TEXT,
+    action TEXT, hops TEXT, reason TEXT)"""
+SCHEMA = (
+    """
 CREATE TABLE job(id TEXT PRIMARY KEY, config TEXT, state TEXT, created REAL,
     finished REAL, pid INTEGER, message TEXT DEFAULT '', limited INTEGER DEFAULT 0);
 CREATE TABLE pages(url TEXT PRIMARY KEY, depth INTEGER, source TEXT, status INTEGER,
     content_type TEXT, ms INTEGER, indexability TEXT, title TEXT, description TEXT,
-    h1 TEXT, canonical TEXT, redirect TEXT, words INTEGER, content_hash TEXT, details TEXT);
+    h1 TEXT, canonical TEXT, redirect TEXT, words INTEGER, content_hash TEXT, details TEXT, request_kind TEXT);
 CREATE TABLE links(source TEXT, target TEXT, kind TEXT, anchor TEXT, nofollow INTEGER,
     PRIMARY KEY(source,target,kind,anchor,nofollow));
 CREATE INDEX links_target ON links(target);
@@ -38,8 +42,12 @@ CREATE INDEX render_url ON render_changes(url,field);
 CREATE TABLE similar_pages(url TEXT,target TEXT,similarity REAL,PRIMARY KEY(url,target));
 CREATE TABLE link_suggestions(url TEXT,target TEXT,anchor TEXT,snippet TEXT,PRIMARY KEY(url,target));
 """
+    + ROBOTS_SCHEMA
+    + ";"
+)
 TABLES = {
     "pages": "url",
+    "robots": "url",
     "web_vitals": "url,device",
     "excluded_urls": "url",
     "render_changes": "url,field,before,after",
@@ -65,6 +73,7 @@ PAGE_COLUMNS = (
     "words",
     "content_hash",
     "details",
+    "request_kind",
 )
 
 
@@ -114,6 +123,33 @@ def issue(db, code, severity, url, evidence):
         "INSERT OR IGNORE INTO issues VALUES(?,?,?,?)",
         (code, severity, url, str(evidence)[:3000]),
     )
+
+
+def prepare_worker(db):
+    # A queued job can have been created by the previous Desktop version.
+    db.execute(ROBOTS_SCHEMA)
+    if "request_kind" not in {r[1] for r in db.execute("PRAGMA table_info(pages)")}:
+        db.execute("ALTER TABLE pages ADD COLUMN request_kind TEXT")
+
+
+def save_robots(db, policy):
+    existing_transaction = db.in_transaction
+    data = policy.report()
+    db.execute(
+        "INSERT OR REPLACE INTO robots VALUES(?,?,?,?,?)",
+        (
+            data["url"],
+            data["outcome"],
+            data["action"],
+            json.dumps(data["hops"]),
+            data["reason"],
+        ),
+    )
+    if policy.action == "continue_without_rules":
+        issue(db, "robots_redirect_fallback", "medium", data["url"], policy.reason)
+    if not existing_transaction:
+        # Expose the decision and release the write lock before fetching the page.
+        db.commit()
 
 
 def save_page(db, record):
@@ -166,6 +202,15 @@ def job_status(db):
     row["config"] = json.loads(row["config"])
     row["limited"] = bool(row["limited"])
     row["pages_checked"] = db.execute("SELECT count(*) FROM pages").fetchone()[0]
+    if db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='robots'"
+    ).fetchone():
+        seed = row["config"]["urls"][0]
+        evidence = report(db, "robots", 0, 1, url=origin(seed) + "/robots.txt")["rows"]
+        row["seed_robots"] = evidence[0] if evidence else None
+        row["checked_by_kind"] = dict(
+            db.execute("SELECT request_kind,count(*) FROM pages GROUP BY request_kind")
+        )
     row["coverage"] = dict(
         db.execute("SELECT indexability,count(*) FROM pages GROUP BY indexability")
     )
@@ -213,6 +258,7 @@ def query(
         "similar_pages": {"url", "target"},
         "link_suggestions": {"url", "target"},
         "pages": {"url", "status"},
+        "robots": {"url"},
         "issues": {"url", "code", "severity"},
     }[table]
     conditions, params = [], []
@@ -237,6 +283,8 @@ def report(db, table, offset, limit, **filters):
     for row in rows:
         if "details" in row:
             row["details"] = json.loads(row["details"])
+        if table == "robots":
+            row["hops"] = json.loads(row["hops"])
     return {"rows": rows, "next_offset": offset + len(rows) if more else None}
 
 
@@ -302,13 +350,14 @@ def compare(before, after, offset, limit, view="issues", field=None, url=None):
         if field is not None or url is not None:
             raise ValueError("The field and url filters are available for view=fields")
         diff = """WITH absent AS (
-            SELECT DISTINCT o.code,o.severity,o.url,p.indexability,p.status
+            SELECT DISTINCT o.code,o.severity,o.url,p.indexability,p.status,p.details
             FROM previous.issues o LEFT JOIN main.pages p ON p.url=o.url
             WHERE NOT EXISTS (SELECT 1 FROM main.issues n WHERE n.code=o.code AND n.url=o.url)
         ) SELECT 'new' change, n.code,n.severity,n.url FROM main.issues n
           WHERE NOT EXISTS (SELECT 1 FROM previous.issues o WHERE o.code=n.code AND o.url=n.url)
           UNION SELECT CASE
-            WHEN indexability IS NULL OR indexability IN ('fetch_error','robots_blocked','render_error','incomplete') THEN 'not_rechecked'
+            WHEN indexability IS NULL OR indexability IN ('fetch_error','robots_blocked','robots_unavailable','render_error','incomplete') THEN 'not_rechecked'
+            WHEN code IN ('robots_disallow','robots_unavailable') AND json_extract(details,'$.robots_action')='continue_without_rules' THEN 'not_rechecked'
             WHEN code IN ('http_4xx','http_5xx','fetch_error','robots_disallow','robots_unavailable') AND status IS NOT NULL THEN 'resolved'
             WHEN (code LIKE 'duplicate_%' OR code LIKE 'hreflang_%' OR code IN ('broken_link','broken_resource','hreflang_missing_return',
                 'canonical_target_problem','hreflang_target_problem','sitemap_non_indexable','redirect_chain','redirect_loop'))

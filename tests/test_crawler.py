@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import io
 import json
 import os
 import sys
@@ -10,7 +11,7 @@ import zipfile
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
 from mcp import ClientSession, StdioServerParameters
@@ -18,7 +19,14 @@ from mcp.client.stdio import stdio_client
 
 from flin_crawler_mcp import storage
 from flin_crawler_mcp.analysis import extract
-from flin_crawler_mcp.network import Response, Rules, checked_address, url_for
+from flin_crawler_mcp.network import (
+    Response,
+    Rules,
+    SiteClient,
+    checked_address,
+    fetch,
+    url_for,
+)
 from flin_crawler_mcp.worker import run
 
 BASE = "https://fixture.example"
@@ -184,6 +192,212 @@ class UnitCrawl(unittest.TestCase):
             db.commit()
             run(crawl_id)
             self.assertEqual(storage.job_status(db)["state"], "cancelled")
+
+    def test_separate_page_and_resource_budgets(self):
+        markup = "".join(f'<img src="/image/{n}">' for n in range(20))
+        markup += '<a href="/extra">Extra</a><a href="/more">More</a>'
+        with patch.dict(FIXTURE, {"/": (200, "text/html", markup)}):
+            for limit, expected in [
+                (None, {"page": 2}),
+                (0, {"page": 2}),
+                (3, {"page": 2, "asset": 3}),
+            ]:
+                with (
+                    self.subTest(limit=limit),
+                    closing(
+                        storage.connect(
+                            self.crawl(
+                                max_urls=2, max_resource_urls=limit, use_sitemaps=False
+                            )
+                        )
+                    ) as db,
+                ):
+                    state = storage.job_status(db)
+                    self.assertEqual(state["checked_by_kind"], expected)
+                    self.assertEqual(state["pages_checked"], sum(expected.values()))
+                    self.assertTrue(state["limited"])
+
+    def test_pinned_https_request_uses_canonical_host(self):
+        # Emulate a canonical-host rule using the actual bytes sent by http.client.
+        from flin_crawler_mcp.server import check_robots
+
+        wire = Mock()
+
+        def respond(*args):
+            request = wire.sendall.call_args.args[0]
+            if b"\r\nHost: fixture.example\r\n" in request:
+                return io.BytesIO(
+                    b"HTTP/1.1 200 OK\r\n\r\nUser-agent: *\nDisallow: /private"
+                )
+            return io.BytesIO(
+                b"HTTP/1.1 301 Moved\r\nLocation: https://fixture.example/robots.txt\r\n\r\n"
+            )
+
+        wire.makefile.side_effect = respond
+        with (
+            patch("flin_crawler_mcp.network.checked_address", return_value="192.0.2.1"),
+            patch("socket.create_connection", return_value=wire) as connect,
+            patch("flin_crawler_mcp.network.tls_context") as tls,
+        ):
+            tls.return_value.wrap_socket.return_value = wire
+            result = check_robots(BASE + "/private")
+            self.assertEqual(result["outcome"], "loaded")
+            self.assertEqual(
+                result["hops"], [{"url": BASE + "/robots.txt", "status": 200}]
+            )
+            self.assertFalse(result["crawl_allowed"])
+            connect.assert_called_once_with(("192.0.2.1", 443), timeout=12)
+            tls.return_value.wrap_socket.assert_called_once_with(
+                wire, server_hostname="fixture.example"
+            )
+            for scheme, host in [
+                ("http", "fixture.example"),
+                ("https", "fixture.example:8443"),
+                ("https", "[2001:db8::1]:9443"),
+            ]:
+                fetch(f"{scheme}://{host}/robots.txt")
+                self.assertIn(
+                    f"\r\nHost: {host}\r\n".encode(), wire.sendall.call_args.args[0]
+                )
+
+    def test_robots_redirect_evidence_and_cached_rules_in_both_modes(self):
+        other = "https://cdn.example"
+        initial = BASE + "/robots.txt"
+        targets = ["/one", "//cdn.example/two", "three", "/four", "five"]
+        chain = [
+            initial,
+            BASE + "/one",
+            other + "/two",
+            other + "/three",
+            other + "/four",
+            other + "/five",
+        ]
+
+        def network(url, **kwargs):
+            if url in chain[:-1]:
+                i = chain.index(url)
+                return Response(
+                    (301, 302, 303, 307, 308)[i], {"location": targets[i]}, b"", 1
+                )
+            if url == chain[-1]:
+                return fixture(initial)
+            return fixture(url)
+
+        for mode in ("list", "spider"):
+            cid = storage.create(
+                config(mode=mode, urls=[BASE + "/", BASE + "/private"])
+            )
+            with patch(
+                "flin_crawler_mcp.network.fetch", side_effect=network
+            ) as request:
+                run(cid)
+            with closing(storage.connect(cid)) as db:
+                trace = storage.job_status(db)["seed_robots"]
+                self.assertEqual(trace["action"], "apply_rules")
+                self.assertEqual([h["url"] for h in trace["hops"]], chain)
+                self.assertEqual(
+                    [h["status"] for h in trace["hops"]], [301, 302, 303, 307, 308, 200]
+                )
+                self.assertEqual([h["location"] for h in trace["hops"][:-1]], targets)
+                self.assertEqual([h["target"] for h in trace["hops"][:-1]], chain[1:])
+                self.assertEqual(storage.report(db, "robots", 0, 5)["rows"], [trace])
+                self.assertEqual(
+                    storage.report(db, "pages", 0, 1, url=BASE + "/private")["rows"][0][
+                        "indexability"
+                    ],
+                    "robots_blocked",
+                )
+                requested = [c.args[0] for c in request.call_args_list]
+                self.assertEqual(requested.count(initial), 1)
+                self.assertNotIn(BASE + "/private", requested)
+                self.assertEqual(BASE + "/child.xml" in requested, mode == "spider")
+
+    def test_robots_failure_boundaries(self):
+        initial = BASE + "/robots.txt"
+
+        def redirect(target):
+            return Response(301, {"location": target}, b"", 1)
+
+        def final(status, body=b""):
+            return Response(status, {"content-type": "text/html"}, body, 1)
+
+        cases = [
+            ([redirect("/robots.txt#same")], "redirect_loop", True),
+            ([redirect("/other"), redirect("/robots.txt")], "redirect_loop", True),
+            ([redirect(f"/r{i}") for i in range(6)], "redirect_limit", True),
+            ([Response(301, {}, b"", 1)], "invalid_redirect", False),
+            ([redirect("file:///robots.txt")], "invalid_redirect", False),
+            (
+                [
+                    redirect("/login"),
+                    final(200, b"<!doctype html><title>Login</title>"),
+                ],
+                "html_response",
+                False,
+            ),
+            ([redirect("/failed"), OSError("timeout")], "fetch_error", False),
+            *[([final(s)], "http_error", False) for s in (401, 403, 429, 503)],
+        ]
+        for replies, outcome, continuable in cases:
+            for fallback in (None, BASE, "https://other.example"):
+                with self.subTest(outcome=outcome, fallback=fallback):
+                    client = SiteClient(
+                        0, lambda: None, redirect_fallback_origin=fallback
+                    )
+                    with patch(
+                        "flin_crawler_mcp.network.fetch", side_effect=replies
+                    ) as network:
+                        policy = client.policy(initial)
+                        self.assertIs(client.policy(BASE + "/page"), policy)
+                    self.assertEqual(network.call_count, len(replies))
+                    self.assertEqual(policy.outcome, outcome)
+                    self.assertEqual(
+                        policy.rules.allows(BASE + "/"),
+                        continuable and fallback == BASE,
+                    )
+                    self.assertTrue(policy.reason)
+        with patch("flin_crawler_mcp.network.fetch", return_value=final(404)):
+            self.assertEqual(
+                SiteClient(0, lambda: None).policy(initial).action, "allow"
+            )
+        credentials = (BASE, {"Authorization": "test"})
+        with patch(
+            "flin_crawler_mcp.network.fetch",
+            side_effect=[redirect("https://cdn.example/rules"), fixture(initial)],
+        ) as network:
+            SiteClient(0, lambda: None, credentials).policy(initial)
+            self.assertEqual(
+                network.call_args_list[0].kwargs["request_headers"], credentials[1]
+            )
+            self.assertNotIn("request_headers", network.call_args_list[1].kwargs)
+
+    def test_robots_fallback_report_and_comparison(self):
+        with patch.dict(FIXTURE, {"/robots.txt": (301, "/robots.txt", "")}):
+            blocked = self.crawl(mode="list")
+            continued = self.crawl(mode="list", allow_robots_redirect_failure=True)
+        with closing(storage.connect(blocked)) as db:
+            self.assertEqual(
+                storage.job_status(db)["coverage"], {"robots_unavailable": 1}
+            )
+            self.assertEqual(
+                storage.job_status(db)["seed_robots"]["outcome"], "redirect_loop"
+            )
+        with closing(storage.connect(continued)) as db:
+            state = storage.job_status(db)
+            self.assertEqual(state["seed_robots"]["action"], "continue_without_rules")
+            self.assertEqual(state["coverage"], {"indexable": 1})
+            self.assertIn(
+                "robots_redirect_fallback", {i["code"] for i in state["top_issues"]}
+            )
+        self.assertIn(
+            {
+                "url": BASE + "/",
+                "code": "robots_unavailable",
+                "change": "not_rechecked",
+                "severity": "high",
+            },
+            storage.compare(blocked, continued, 0, 100)["rows"],
+        )
 
     def test_group_shared_footer_link_across_templates(self):
         from flin_crawler_mcp.server import group_crawl_issues
@@ -374,6 +588,7 @@ class UnitCrawl(unittest.TestCase):
                 "similar_pages",
                 "link_suggestions",
                 "page_text",
+                "robots",
             ):
                 db.execute("DROP TABLE " + name)
             db.execute("UPDATE pages SET details='{}'")
@@ -381,6 +596,9 @@ class UnitCrawl(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "predates"):
                 storage.report(db, "render_changes", 0, 10)
             self.assertTrue(storage.report(db, "issues", 0, 10)["rows"])
+            self.assertNotIn("seed_robots", storage.job_status(db))
+            with self.assertRaisesRegex(ValueError, "predates"):
+                storage.report(db, "robots", 0, 10)
         self.assertEqual(
             group_crawl_issues(cid, code="broken_link")["rows"][0]["location"],
             "unknown",

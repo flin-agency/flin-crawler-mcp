@@ -4,7 +4,7 @@ Ask Claude Desktop to crawl a website, then inspect the URLs and source links be
 
 ## Install in Claude Desktop
 
-Open the **flin-crawler-mcp-0.2.0.mcpb** file in Claude Desktop and select **Install**. Use a current Claude Desktop version with UV extension support. On first launch Claude downloads Python and the Python dependencies. For rendered crawls, install Google Chrome or use Playwright Chromium. The crawler uses an isolated browser profile.
+Open the **flin-crawler-mcp-0.2.1.mcpb** file in Claude Desktop and select **Install**. Use a current Claude Desktop version with UV extension support. On first launch Claude downloads Python and the Python dependencies. For rendered crawls, install Google Chrome or use Playwright Chromium. The crawler uses an isolated browser profile.
 
 After a release, download the extension from [GitHub Releases](https://github.com/flin-agency/flin-crawler-mcp/releases). To build the same extension from a checkout, run `python3 scripts/build_desktop.py`. The file appears in `dist/`.
 
@@ -31,6 +31,7 @@ Alternatively, after PyPI publication use this Claude Desktop developer configur
 | Tool | What it returns |
 | --- | --- |
 | `start_crawl` | Background job ID. Spider mode follows links. List mode checks the seed and supplied URLs only. |
+| `check_robots` | Checks one URL against its origin's robots.txt with the crawler's own GET. Returns each HTTP status, redirect target, rules decision and declared sitemaps. |
 | `crawl_status` | Progress, completion state, coverage limit, issue counts and configuration. |
 | `crawl_results` | Filterable, paginated pages, findings or link evidence. Filter links by target to get inlinks. |
 | `export_crawl` | Full or filtered CSV file, row count and local path. |
@@ -47,7 +48,15 @@ The crawler captures HTTP status and response times, redirect targets, chains an
 
 Spider mode defaults to the seed hostname, supports explicitly included hosts, allows standard HTTP/HTTPS transitions, respects robots.txt and crawl delays, and discovers XML sitemaps and sitemap indexes. Seed the final hostname when a site switches between apex and www. External link checks are opt-in and do not expand the external site. Empty alt attributes are valid for decorative images. Technical indexability describes the crawl signals, not Google's index.
 
-The default budget is 500 URLs, depth 8, with a 300 ms minimum interval per origin. Set `max_urls` up to 25,000. Linked assets and enabled external checks share that budget. HTML, sitemap and render responses are limited to 5 MiB. Sitemap discovery runs after linked pages; depth 0 on a sitemap URL describes its discovery as a seed. Source HTML is the default. In JavaScript mode, the browser loads public GET resources, waits for DOMContentLoaded and a configurable interval, and analyses the resulting DOM. Images, fonts, media, POST requests, service workers, WebSockets and additional navigations are excluded from rendering. The crawler operates independently of Search Console.
+The default budget is 500 URLs, depth 8, with a 300 ms minimum interval per origin. Set `max_urls` up to 25,000. Linked assets and enabled external checks share that budget by default. For a 100-URL page audit with up to 200 additional resource checks, use `max_urls=100`, `max_resource_urls=200` and `check_assets=true`. Page candidates include redirects, errors and directly linked documents such as PDFs. The status field `checked_by_kind` counts page candidates, assets and external checks. These limits cover audit records. JavaScript rendering has its own limit of 100 browser requests per page.
+
+HTML, sitemap and render responses are limited to 5 MiB. Sitemap discovery runs after linked pages; depth 0 on a sitemap URL describes its discovery as a seed. Source HTML is the default. In JavaScript mode, the browser loads public GET resources, waits for DOMContentLoaded and a configurable interval, and analyses the resulting DOM. Images, fonts, media, POST requests, service workers, WebSockets and additional navigations are excluded from rendering. The crawler operates independently of Search Console.
+
+### Diagnose robots.txt
+
+Ask «Prüfe mit `check_robots` die URL https://flin.agency/ und zeige jede Weiterleitung und die Entscheidung für die Startseite.» Each crawl caches the policy per origin and follows up to five redirects, including changes of host. The resulting rules apply to the initial origin. For a saved crawl, inspect `crawl_status.seed_robots` or query `crawl_results(dataset="robots")` for all observed origins. The trace includes each requested URL and status, the Location and resolved target of valid redirects, and the reason the crawler stopped.
+
+An explicit Disallow is recorded as `robots_blocked`. A failed robots fetch is recorded as `robots_unavailable`. A loop or sixth redirect blocks the crawl by default. For an audit of your own site, set `allow_robots_redirect_failure=true` to continue on the exact seed origin in those two cases. The crawl records a `robots_redirect_fallback` finding. Valid rules, authentication errors, rate limits and server errors still apply. Existing crawl records retain the evidence collected by their installed version.
 
 ## Audit reports
 

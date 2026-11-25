@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from urllib.parse import urlsplit, unquote_plus
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import ExitStack
 
 from defusedxml import ElementTree
@@ -34,8 +34,7 @@ def sitemap_entries(client, seed, db, seeds, budget, hosts=()):
             continue
         seen.add(link)
         try:
-            rules, _ = client.policy(link)
-            if not rules.allows(link):
+            if not client.policy(link).rules.allows(link):
                 continue
             result = client.get(link)
             if result.status in REDIRECTS:
@@ -116,7 +115,10 @@ def perform(db, config, client, stopped, renderer=None):
     urls, max_urls = config["urls"], config["max_urls"]
     seed = urls[0]
     hosts = config.get("additional_hosts", [])
-    queue, assets, queued = deque(), deque(), set()
+    max_resources = config.get("max_resource_urls")
+    resource_budget = max_urls if max_resources is None else max_resources
+    queue, assets, queued = deque(), OrderedDict(), set()
+    page_count, resource_count = 0, 0
     limited = False
     variants = {}
     excluded = set()
@@ -125,9 +127,23 @@ def perform(db, config, client, stopped, renderer=None):
 
     def schedule(url, depth, source, kind="page"):
         nonlocal limited
-        if url in queued or depth > config["max_depth"]:
+        if depth > config["max_depth"]:
             return
-        if len(queued) >= max_urls * 5:
+        if url in queued:
+            if (
+                kind == "page"
+                and url in assets
+                and len(queue) + page_count < max_urls * 5
+            ):
+                del assets[url]
+                queue.append((url, depth, source, kind))
+            return
+        pending, checked, budget = (
+            (queue, page_count, max_urls)
+            if kind == "page"
+            else (assets, resource_count, resource_budget)
+        )
+        if len(pending) + checked >= budget * 5:
             limited = True
             return
         if config["exclude_paths"] and urlsplit(url).path.startswith(
@@ -161,15 +177,20 @@ def perform(db, config, client, stopped, renderer=None):
                 return
             variants[key] = variants.get(key, 0) + 1
         queued.add(url)
-        (queue if kind == "page" else assets).append((url, depth, source, kind))
+        item = (url, depth, source, kind)
+        if kind == "page":
+            queue.append(item)
+        else:
+            assets[url] = item
 
     for url in urls:
         schedule(url, 0, "seed")
-    count, loaded_sitemaps = 0, False
-    while count < max_urls:
+    loaded_sitemaps = False
+    while max_resources is not None or page_count + resource_count < max_urls:
         stopped()
         if (
             not queue
+            and page_count < max_urls
             and not loaded_sitemaps
             and config["use_sitemaps"]
             and config["mode"] == "spider"
@@ -184,7 +205,7 @@ def perform(db, config, client, stopped, renderer=None):
                     for host in hosts
                 ]
             ):
-                rules, _ = client.policy(site)
+                rules = client.policy(site).rules
                 sitemaps.extend(
                     url_for(candidate, site)
                     for candidate in (rules.sitemaps or [site + "/sitemap.xml"])
@@ -194,19 +215,26 @@ def perform(db, config, client, stopped, renderer=None):
             ):
                 schedule(dest, 0, "sitemap")
             db.commit()
-        if not queue and not assets:
+        if queue and page_count < max_urls:
+            url, depth, source, kind = queue.popleft()
+            page_count += 1
+        elif assets and resource_count < resource_budget:
+            _, (url, depth, source, kind) = assets.popitem(last=False)
+            resource_count += 1
+        else:
             break
-        url, depth, source, kind = (queue or assets).popleft()
-        rules, reason = client.policy(url)
-        record = {"url": url, "source": source, "depth": depth}
+        policy = client.policy(url)
+        record = {"url": url, "source": source, "depth": depth, "request_kind": kind}
         findings, edges, changes, explicit_alternates = [], [], [], []
-        if not rules.allows(url):
-            record["indexability"] = "robots_blocked"
+        if not policy.rules.allows(url):
+            record["indexability"] = (
+                "robots_unavailable" if policy.reason else "robots_blocked"
+            )
             findings.append(
                 (
-                    "robots_unavailable" if reason else "robots_disallow",
-                    "high" if reason else "info",
-                    reason or "Disallowed by robots.txt",
+                    "robots_unavailable" if policy.reason else "robots_disallow",
+                    "high" if policy.reason else "info",
+                    policy.reason or "Disallowed by robots.txt",
                 )
             )
         else:
@@ -328,6 +356,8 @@ def perform(db, config, client, stopped, renderer=None):
             except (OSError, ValueError, http.client.HTTPException) as err:
                 record["indexability"] = "fetch_error"
                 findings.append(("fetch_error", "high", str(err)))
+        if policy.action == "continue_without_rules":
+            record.setdefault("details", {})["robots_action"] = policy.action
         with db:
             if "_text" in record:
                 db.execute("INSERT INTO page_text VALUES(?,?,?,?)", record.pop("_text"))
@@ -348,7 +378,6 @@ def perform(db, config, client, stopped, renderer=None):
             db.executemany("INSERT OR IGNORE INTO links VALUES(?,?,?,?,?)", edges)
             for code, severity, evidence in findings:
                 storage.issue(db, code, severity, url, evidence)
-        count += 1
     with db:
         db.execute(
             "UPDATE job SET limited=?",
@@ -357,7 +386,7 @@ def perform(db, config, client, stopped, renderer=None):
                     limited
                     or bool(queue or assets)
                     or (
-                        count == max_urls
+                        page_count == max_urls
                         and config["use_sitemaps"]
                         and config["mode"] == "spider"
                         and not loaded_sitemaps
@@ -395,7 +424,16 @@ def run(crawl_id):
                 if config.get("staging_auth")
                 else None
             )
-            client = SiteClient(config["delay_ms"] / 1000, stopped, credentials)
+            storage.prepare_worker(db)
+            client = SiteClient(
+                config["delay_ms"] / 1000,
+                stopped,
+                credentials,
+                redirect_fallback_origin=origin(config["urls"][0])
+                if config.get("allow_robots_redirect_failure")
+                else None,
+                on_policy=lambda policy: storage.save_robots(db, policy),
+            )
             with ExitStack() as resources:
                 renderer = None
                 if config["render_js"]:
